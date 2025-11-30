@@ -1,4 +1,4 @@
-// File: sequential.c — NYC311 header-driven CSV clustering with heavy analytics
+// File: pthreads.c — NYC311 header-driven CSV clustering with heavy analytics
 #define _POSIX_C_SOURCE 199309L
 #include <stdio.h>
 #include <stdlib.h>
@@ -7,6 +7,8 @@
 #include <time.h>
 #include <ctype.h>
 #include <unistd.h>
+#include <pthread.h>
+
 
 // Section: Configuration constants and thresholds
 #define MAX_LINE 8192                   // Maximum size of a single CSV line buffer
@@ -65,6 +67,31 @@ typedef struct {
     double axis_ratio;          // Shape anisotropy sqrt(lambda_max/lambda_min)
 } ClusterStats;
 
+typedef struct {
+    int* members;   // array of row indices belonging to each cluster
+    int* offsets;   // offsets[c]..offsets[c+1]-1 gives member range
+} MembershipIndex;
+
+typedef struct {
+    ServiceRequest* req;
+    ClusterStats*   stats;
+    const MembershipIndex* mi;
+    int c_start;
+    int c_end;
+} AxisRatioTask;
+
+typedef struct { int idx; int members; } HistView; // For pairwise histogram median
+typedef struct {
+    ServiceRequest* req;
+    ClusterStats*   stats;
+    const MembershipIndex* mi;
+    HistView*       v;
+    int t_start;
+    int t_end;
+    int NBINS;
+} HistMedianTask;
+
+
 // Section: Small helpers (math, string trimming/lowercasing, and distances)
 static inline double deg_to_rad(double d){ return d * 3.14159265358979323846 / 180.0; } // Convert degrees to radians
 
@@ -110,6 +137,20 @@ static inline void majority_vote_update(char* cur, int* cnt, const char* val) { 
     if (*cnt == 0) { strncpy(cur, val, 127); cur[127]='\0'; *cnt = 1; }
     else if (strcmp(cur, val) == 0) (*cnt)++; else (*cnt)--;
 }
+
+// ======== Pthread helpers and global thread count ========
+
+static int get_num_threads(void) {
+    static int cached = 0;
+    if (cached > 0) return cached;
+
+    long p = sysconf(_SC_NPROCESSORS_ONLN);
+    if (p <= 0) p = 4;          // Fallback
+    if (p > 64) p = 64;         // Reasonable upper bound
+    cached = (int)p;
+    return cached;
+}
+
 
 // Section: CSV parsing (header-driven, robust to column order)
 typedef struct {
@@ -349,7 +390,6 @@ void calculate_cluster_stats(ServiceRequest* req, int n, ClusterStats** out_stat
 }
 
 // Section: Membership index for clusters (contiguous member ranges)
-typedef struct { int* members; int* offsets; } MembershipIndex; // members: row indices; offsets[c]..offsets[c+1]-1 range for cluster c
 
 static MembershipIndex build_membership_index(ServiceRequest* req, int n, int k) { // Build cluster -> member index
     MembershipIndex mi={0};
@@ -373,23 +413,98 @@ static CenterRad* centers_rad_from_stats(ClusterStats* s, int k){ // Convert cen
     return cr;
 }
 
-// Section: Axis ratio (anisotropy) via covariance
-static void compute_axis_ratio(ServiceRequest* req, ClusterStats* stats, int k, const MembershipIndex* mi){ // Compute axis ratios
-    for(int c=0;c<k;c++){
-        int off=mi->offsets[c], len=mi->offsets[c+1]-off;
-        if (len<2){ stats[c].axis_ratio=1.0; continue; }
-        double mx=0,my=0;                       // Mean longitude/latitude
-        for(int t=0;t<len;t++){ int i=mi->members[off+t]; mx += req[i].longitude; my += req[i].latitude; }
-        mx/=len; my/=len;
-        double sxx=0, syy=0, sxy=0;             // Covariance components
-        for(int t=0;t<len;t++){ int i=mi->members[off+t]; double x=req[i].longitude-mx, y=req[i].latitude-my; sxx+=x*x; syy+=y*y; sxy+=x*y; }
-        sxx/=len; syy/=len; sxy/=len;
-        double tr=sxx+syy; double det=sxx*syy - sxy*sxy; // Trace/determinant of covariance
-        double disc=tr*tr - 4*det; if(disc<0) disc=0;
-        double l1=(tr + sqrt(disc))/2.0, l2=(tr - sqrt(disc))/2.0; // Eigenvalues
-        if (l2 <= 1e-12) stats[c].axis_ratio = (l1<=1e-12)?1.0 : 1e6;
-        else stats[c].axis_ratio = sqrt(l1/l2);
+// ======== Axis ratio (anisotropy) via covariance — PTHREADS PARALLEL ========
+static void* axis_ratio_worker(void* arg) {
+    AxisRatioTask* task = (AxisRatioTask*)arg;
+    ServiceRequest* req = task->req;
+    ClusterStats* stats = task->stats;
+    const MembershipIndex* mi = task->mi;
+    int c_start = task->c_start;
+    int c_end   = task->c_end;
+
+    for (int c = c_start; c < c_end; c++) {
+        int off = mi->offsets[c];
+        int len = mi->offsets[c + 1] - off;
+        if (len < 2) {
+            stats[c].axis_ratio = 1.0;
+            continue;
+        }
+
+        double mx = 0.0, my = 0.0;    // Mean longitude/latitude
+        for (int t = 0; t < len; t++) {
+            int i = mi->members[off + t];
+            mx += req[i].longitude;
+            my += req[i].latitude;
+        }
+        mx /= len;
+        my /= len;
+
+        double sxx = 0.0, syy = 0.0, sxy = 0.0; // Covariance components
+        for (int t = 0; t < len; t++) {
+            int i = mi->members[off + t];
+            double x = req[i].longitude - mx;
+            double y = req[i].latitude  - my;
+            sxx += x * x;
+            syy += y * y;
+            sxy += x * y;
+        }
+        sxx /= len;
+        syy /= len;
+        sxy /= len;
+
+        double tr   = sxx + syy;
+        double det  = sxx * syy - sxy * sxy;
+        double disc = tr * tr - 4.0 * det;
+        if (disc < 0.0) disc = 0.0;
+
+        double sqrt_disc = sqrt(disc);
+        double l1 = (tr + sqrt_disc) / 2.0;
+        double l2 = (tr - sqrt_disc) / 2.0;
+
+        if (l2 <= 1e-12) {
+            stats[c].axis_ratio = (l1 <= 1e-12) ? 1.0 : 1e6;
+        } else {
+            stats[c].axis_ratio = sqrt(l1 / l2);
+        }
     }
+
+    return NULL;
+}
+
+static void compute_axis_ratio(ServiceRequest* req, ClusterStats* stats, int k, const MembershipIndex* mi) {
+    if (k <= 0) return;
+
+    int nt = get_num_threads();
+    if (nt > k) nt = k;
+    if (nt < 1) nt = 1;
+
+    pthread_t* threads = (pthread_t*)malloc(sizeof(pthread_t) * nt);
+    AxisRatioTask* tasks = (AxisRatioTask*)malloc(sizeof(AxisRatioTask) * nt);
+
+    int base = k / nt;
+    int rem  = k % nt;
+    int start = 0;
+
+    for (int t = 0; t < nt; t++) {
+        int len = base + (t < rem ? 1 : 0);
+        int end = start + len;
+
+        tasks[t].req    = req;
+        tasks[t].stats  = stats;
+        tasks[t].mi     = mi;
+        tasks[t].c_start = start;
+        tasks[t].c_end   = end;
+
+        pthread_create(&threads[t], NULL, axis_ratio_worker, &tasks[t]);
+        start = end;
+    }
+
+    for (int t = 0; t < nt; t++) {
+        pthread_join(threads[t], NULL);
+    }
+
+    free(threads);
+    free(tasks);
 }
 
 // Section: Compactness and approximate silhouette using centroid windows
@@ -476,42 +591,138 @@ static void compute_compactness_and_silhouette(ServiceRequest* req, int n, Clust
     free(centers); free(cidx); free(sum_dist); free(sum_silh); free(cnt);
 }
 
-// Section: Pairwise histogram median for top clusters (O(m^2))
-static void compute_pairwise_median_for_top_clusters(ServiceRequest* req, ClusterStats* stats, int k, const MembershipIndex* mi) { // Compute med_pair_km
-#if HIST_ENABLE
-    typedef struct{ int idx; int members; } View; // Cluster view: id and size
-    View* v=(View*)malloc(sizeof(View)*k);
-    for(int i=0;i<k;i++){ v[i].idx=i; v[i].members=stats[i].member_count; }
-    int cmpv(const void*a,const void*b){ int aa=((const View*)a)->members, bb=((const View*)b)->members; return (aa>bb)?-1:(aa<bb)?1:0; }
-    qsort(v,k,sizeof(View),cmpv);
+// ======== Pairwise histogram median for top clusters (O(m^2)) — PTHREADS PARALLEL ========
+static void* hist_median_worker(void* arg) {
+    HistMedianTask* task = (HistMedianTask*)arg;
+    ServiceRequest* req   = task->req;
+    ClusterStats*   stats = task->stats;
+    const MembershipIndex* mi = task->mi;
+    HistView*       v     = task->v;
+    int t_start          = task->t_start;
+    int t_end            = task->t_end;
+    const int NBINS      = task->NBINS;
 
-    const int NBINS = (int)(HIST_MAX_DIST_KM / HIST_BIN_KM) + 1;   // Number of histogram bins
-    unsigned long long* hist=(unsigned long long*)malloc(sizeof(unsigned long long)*NBINS); // Histogram buffer
+    // Each thread gets its own histogram buffer -> no sharing/races
+    unsigned long long* hist = (unsigned long long*)malloc(sizeof(unsigned long long) * NBINS);
+    if (!hist) return NULL;
 
-    int top = (HIST_TOPK<k)?HIST_TOPK:k;                           // Number of clusters to process
-    for(int t=0;t<top;t++){
-        int cid=v[t].idx;                                          // Current cluster id
-        int off=mi->offsets[cid], len=mi->offsets[cid+1]-off;      // Member range
-        if (len<2){ stats[cid].med_pair_km=0.0; continue; }
-        int m=len; if(m>HIST_MAX_MEMBERS) m=HIST_MAX_MEMBERS;      // Truncated member count
+    for (int t = t_start; t < t_end; t++) {
+        int cid = v[t].idx;
+        int off = mi->offsets[cid];
+        int len = mi->offsets[cid + 1] - off;
 
-        memset(hist,0,sizeof(unsigned long long)*NBINS);
-        for(int i=0;i<m;i++){
-            int ii=mi->members[off+i];
-            for(int j=i+1;j<m;j++){
-                int jj=mi->members[off+j];
-                double d=dist_km_equirect(req[ii].lat_rad, req[ii].lon_rad, req[ii].cos_lat,
-                                          req[jj].lat_rad, req[jj].lon_rad, req[jj].cos_lat);
-                int bin=(int)(d/HIST_BIN_KM);
-                if(bin<0) bin=0; if(bin>=NBINS) bin=NBINS-1; hist[bin]++;
+        if (len < 2) {
+            stats[cid].med_pair_km = 0.0;
+            continue;
+        }
+
+        int m = len;
+        if (m > HIST_MAX_MEMBERS) m = HIST_MAX_MEMBERS;
+
+        memset(hist, 0, sizeof(unsigned long long) * NBINS);
+
+        for (int i = 0; i < m; i++) {
+            int ii = mi->members[off + i];
+            for (int j = i + 1; j < m; j++) {
+                int jj = mi->members[off + j];
+
+                double d = dist_km_equirect(req[ii].lat_rad, req[ii].lon_rad, req[ii].cos_lat,
+                                            req[jj].lat_rad, req[jj].lon_rad, req[jj].cos_lat);
+
+                int bin = (int)(d / HIST_BIN_KM);
+                if (bin < 0) bin = 0;
+                if (bin >= NBINS) bin = NBINS - 1;
+                hist[bin]++;
             }
         }
-        unsigned long long total_pairs=(unsigned long long)m*(unsigned long long)(m-1)/2ULL; // Total number of pairs
-        unsigned long long half=(total_pairs+1ULL)/2ULL, cum=0; double med=0.0;              // Median position
-        for(int b=0;b<NBINS;b++){ cum+=hist[b]; if(cum>=half){ med=(b+0.5)*HIST_BIN_KM; break; } }
-        stats[cid].med_pair_km=med;
+
+        unsigned long long total_pairs = (unsigned long long)m * (unsigned long long)(m - 1) / 2ULL;
+        unsigned long long half = (total_pairs + 1ULL) / 2ULL;
+        unsigned long long cum  = 0ULL;
+        double med = 0.0;
+
+        for (int b = 0; b < NBINS; b++) {
+            cum += hist[b];
+            if (cum >= half) {
+                med = (b + 0.5) * HIST_BIN_KM;
+                break;
+            }
+        }
+
+        stats[cid].med_pair_km = med;
     }
-    free(hist); free(v);
+
+    free(hist);
+    return NULL;
+}
+
+static void compute_pairwise_median_for_top_clusters(ServiceRequest* req, ClusterStats* stats, int k, const MembershipIndex* mi) { // Compute med_pair_km
+#if HIST_ENABLE
+    if (k <= 0) return;
+
+    HistView* v = (HistView*)malloc(sizeof(HistView) * k);
+    if (!v) return;
+
+    for (int i = 0; i < k; i++) {
+        v[i].idx     = i;
+        v[i].members = stats[i].member_count;
+    }
+
+    int cmpv(const void* a, const void* b) {
+        int aa = ((const HistView*)a)->members;
+        int bb = ((const HistView*)b)->members;
+        return (aa > bb) ? -1 : (aa < bb) ? 1 : 0;
+    }
+
+    qsort(v, k, sizeof(HistView), cmpv);
+
+    const int NBINS = (int)(HIST_MAX_DIST_KM / HIST_BIN_KM) + 1;
+    int top = (HIST_TOPK < k) ? HIST_TOPK : k;
+    if (top <= 0) {
+        free(v);
+        return;
+    }
+
+    int nt = get_num_threads();
+    if (nt > top) nt = top;
+    if (nt < 1) nt = 1;
+
+    pthread_t* threads = (pthread_t*)malloc(sizeof(pthread_t) * nt);
+    HistMedianTask* tasks = (HistMedianTask*)malloc(sizeof(HistMedianTask) * nt);
+    if (!threads || !tasks) {
+        free(threads);
+        free(tasks);
+        free(v);
+        return;
+    }
+
+    int base = top / nt;
+    int rem  = top % nt;
+    int start = 0;
+
+    for (int t = 0; t < nt; t++) {
+        int len = base + (t < rem ? 1 : 0);
+        int end = start + len;
+
+        tasks[t].req   = req;
+        tasks[t].stats = stats;
+        tasks[t].mi    = mi;
+        tasks[t].v     = v;
+        tasks[t].t_start = start;
+        tasks[t].t_end   = end;
+        tasks[t].NBINS   = NBINS;
+
+        pthread_create(&threads[t], NULL, hist_median_worker, &tasks[t]);
+        start = end;
+    }
+
+    for (int t = 0; t < nt; t++) {
+        pthread_join(threads[t], NULL);
+    }
+
+    free(threads);
+    free(tasks);
+    free(v);
 #else
     (void)req; (void)stats; (void)k; (void)mi;
 #endif

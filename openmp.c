@@ -1,12 +1,14 @@
-// File: sequential.c — NYC311 header-driven CSV clustering with heavy analytics
+// File: openmp.c — NYC311 header-driven CSV clustering with heavy analytics (OpenMP version)
+
 #define _POSIX_C_SOURCE 199309L
+
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 #include <math.h>
 #include <time.h>
 #include <ctype.h>
-#include <unistd.h>
+#include <omp.h>
 
 // Section: Configuration constants and thresholds
 #define MAX_LINE 8192                   // Maximum size of a single CSV line buffer
@@ -290,7 +292,13 @@ void perform_clustering_fast(ServiceRequest* req, int n) { // Assign clusters us
             if (!complaint_prefilter(req[i].complaint_type, req[j].complaint_type)) continue;
 
             double s = calculate_similarity_fast(&req[i], &req[j]);
-            if (s >= SIM_THRESHOLD) { if (mcount>=buf_cap){buf_cap*=2; buf=(int*)realloc(buf,sizeof(int)*buf_cap);} buf[mcount++]=j; }
+            if (s >= SIM_THRESHOLD) {
+                if (mcount>=buf_cap){
+                    buf_cap*=2;
+                    buf=(int*)realloc(buf,sizeof(int)*buf_cap);
+                }
+                buf[mcount++]=j;
+            }
         }
 
         for (int jj=ii+1; jj<n; jj++) {                 // Forward scan within window
@@ -301,12 +309,21 @@ void perform_clustering_fast(ServiceRequest* req, int n) { // Assign clusters us
             if (!complaint_prefilter(req[i].complaint_type, req[j].complaint_type)) continue;
 
             double s = calculate_similarity_fast(&req[i], &req[j]);
-            if (s >= SIM_THRESHOLD) { if (mcount>=buf_cap){buf_cap*=2; buf=(int*)realloc(buf,sizeof(int)*buf_cap);} buf[mcount++]=j; }
+            if (s >= SIM_THRESHOLD) {
+                if (mcount>=buf_cap){
+                    buf_cap*=2;
+                    buf=(int*)realloc(buf,sizeof(int)*buf_cap);
+                }
+                buf[mcount++]=j;
+            }
         }
 
         if (mcount + 1 >= MIN_CLUSTER_SIZE) {           // Commit cluster if size threshold reached
             int cid=next_cluster_id++; req[i].cluster_id=cid;
-            for (int t=0;t<mcount;t++){ int j=buf[t]; if (req[j].cluster_id==-1) req[j].cluster_id=cid; }
+            for (int t=0;t<mcount;t++){
+                int j=buf[t];
+                if (req[j].cluster_id==-1) req[j].cluster_id=cid;
+            }
         }
 
         if ((ii % 10000) == 0) printf("  processed %d/%d, clusters=%d\n", ii, n, next_cluster_id);
@@ -325,6 +342,7 @@ void calculate_cluster_stats(ServiceRequest* req, int n, ClusterStats** out_stat
     int* mj_cnt=(int*)calloc(*out_num,sizeof(int));                           // Majority-vote counters
     for(int i=0;i<*out_num;i++){ stats[i].cluster_id=i; stats[i].dominant_complaint[0]='\0'; }
 
+    // This remains sequential (string majority vote is not trivially reducible)
     for(int i=0;i<n;i++){
         int cid=req[i].cluster_id; if(cid<0) continue;
         stats[cid].member_count++;
@@ -334,16 +352,23 @@ void calculate_cluster_stats(ServiceRequest* req, int n, ClusterStats** out_stat
         if (req[i].created_hour>=0 && req[i].created_hour<24) hour_counts[cid*24 + req[i].created_hour]++;
         majority_vote_update(stats[cid].dominant_complaint, &mj_cnt[cid], req[i].complaint_type);
     }
+
+    // Per-cluster normalization is independent: parallelize with OpenMP
+    #pragma omp parallel for
     for(int i=0;i<*out_num;i++){
         if (stats[i].member_count>0){
             stats[i].centroid_lat       /= stats[i].member_count;
             stats[i].centroid_lon       /= stats[i].member_count;
             stats[i].avg_response_hours /= stats[i].member_count;
             int best=0,besth=0;
-            for(int h=0;h<24;h++){ int v=hour_counts[i*24+h]; if(v>best){best=v; besth=h;} }
+            for(int h=0;h<24;h++){
+                int v=hour_counts[i*24+h];
+                if(v>best){best=v; besth=h;}
+            }
             stats[i].peak_hour=besth;
         }
     }
+
     free(hour_counts); free(mj_cnt);
     *out_stats=stats;
 }
@@ -369,12 +394,20 @@ static MembershipIndex build_membership_index(ServiceRequest* req, int n, int k)
 typedef struct { double lat_r; double lon_r; double cos_lat; } CenterRad; // Centroid in radians with cos(lat)
 static CenterRad* centers_rad_from_stats(ClusterStats* s, int k){ // Convert centroid degrees to radians
     CenterRad* cr=(CenterRad*)malloc(sizeof(CenterRad)*k);
-    for(int i=0;i<k;i++){ cr[i].lat_r=deg_to_rad(s[i].centroid_lat); cr[i].lon_r=deg_to_rad(s[i].centroid_lon); cr[i].cos_lat=cos(cr[i].lat_r); }
+    // Independent per cluster: parallelize
+    #pragma omp parallel for
+    for(int i=0;i<k;i++){
+        cr[i].lat_r=deg_to_rad(s[i].centroid_lat);
+        cr[i].lon_r=deg_to_rad(s[i].centroid_lon);
+        cr[i].cos_lat=cos(cr[i].lat_r);
+    }
     return cr;
 }
 
 // Section: Axis ratio (anisotropy) via covariance
 static void compute_axis_ratio(ServiceRequest* req, ClusterStats* stats, int k, const MembershipIndex* mi){ // Compute axis ratios
+    // Each cluster is independent — parallelize per cluster
+    #pragma omp parallel for
     for(int c=0;c<k;c++){
         int off=mi->offsets[c], len=mi->offsets[c+1]-off;
         if (len<2){ stats[c].axis_ratio=1.0; continue; }
@@ -382,7 +415,11 @@ static void compute_axis_ratio(ServiceRequest* req, ClusterStats* stats, int k, 
         for(int t=0;t<len;t++){ int i=mi->members[off+t]; mx += req[i].longitude; my += req[i].latitude; }
         mx/=len; my/=len;
         double sxx=0, syy=0, sxy=0;             // Covariance components
-        for(int t=0;t<len;t++){ int i=mi->members[off+t]; double x=req[i].longitude-mx, y=req[i].latitude-my; sxx+=x*x; syy+=y*y; sxy+=x*y; }
+        for(int t=0;t<len;t++){
+            int i=mi->members[off+t];
+            double x=req[i].longitude-mx, y=req[i].latitude-my;
+            sxx+=x*x; syy+=y*y; sxy+=x*y;
+        }
         sxx/=len; syy/=len; sxy/=len;
         double tr=sxx+syy; double det=sxx*syy - sxy*sxy; // Trace/determinant of covariance
         double disc=tr*tr - 4*det; if(disc<0) disc=0;
@@ -408,51 +445,35 @@ static void compute_compactness_and_silhouette(ServiceRequest* req, int n, Clust
     double* sum_silh=(double*)calloc(k,sizeof(double)); // Sum of silhouette values
     int*    cnt=(int*)calloc(k,sizeof(int));            // Counts per cluster
 
-    for(int i=0;i<n;i++){
-        int c=req[i].cluster_id; if(c<0) continue;
+    // Manual reduction with thread-local arrays for portability (no OpenMP 5 array-sections)
+    #pragma omp parallel
+    {
+        double* local_dist  = (double*)calloc(k,sizeof(double));
+        double* local_silh  = (double*)calloc(k,sizeof(double));
+        int*    local_cnt   = (int*)calloc(k,sizeof(int));
+
+        #pragma omp for
+        for(int i=0;i<n;i++){
+            int c=req[i].cluster_id; if(c<0) continue;
 
 #if SIL_USE_HAVERSINE
-        double a = dist_km_haversine(req[i].lat_rad, req[i].lon_rad, centers[c].lat_r, centers[c].lon_r); // Own-centroid distance
+            double a = dist_km_haversine(req[i].lat_rad, req[i].lon_rad, centers[c].lat_r, centers[c].lon_r); // Own-centroid distance
 #else
-        double a = dist_km_equirect(req[i].lat_rad, req[i].lon_rad, req[i].cos_lat, centers[c].lat_r, centers[c].lon_r, centers[c].cos_lat);
+            double a = dist_km_equirect(req[i].lat_rad, req[i].lon_rad, req[i].cos_lat, centers[c].lat_r, centers[c].lon_r, centers[c].cos_lat);
 #endif
-        double b = 1e12;                                                  // Nearest other-centroid distance
-        double plat = req[i].latitude;                                    // Point latitude (deg)
-        int lo=0, hi=k-1, mid=0;                                          // Binary search state
-        while (lo<hi){ mid=(lo+hi)/2; if (cidx[mid].lat < plat) lo=mid+1; else hi=mid; }
-        int center_pos = lo;                                              // Start index near plat
+            double b = 1e12;                                                  // Nearest other-centroid distance
+            double plat = req[i].latitude;                                    // Point latitude (deg)
+            int lo=0, hi=k-1, mid=0;                                          // Binary search state
+            while (lo<hi){ mid=(lo+hi)/2; if (cidx[mid].lat < plat) lo=mid+1; else hi=mid; }
+            int center_pos = lo;                                              // Start index near plat
 
-        for(int p=center_pos; p>=0; --p){                                 // Scan backward window
-            int cj=cidx[p].idx; double dlat=fabs(cidx[p].lat - plat);
-            if (dlat > sil_lat_pad) break;
-            if (cj==c) continue;
-            double lon_pad = SEARCH_SPATIAL_KM / (111.32 * fmax(1e-6, cos(deg_to_rad(plat))));
-            double clon = stats[cj].centroid_lon;
-            if (fabs(req[i].longitude - clon) > lon_pad*2) continue;
-#if SIL_USE_HAVERSINE
-            double d = dist_km_haversine(req[i].lat_rad, req[i].lon_rad, centers[cj].lat_r, centers[cj].lon_r);
-#else
-            double d = dist_km_equirect(req[i].lat_rad, req[i].lon_rad, req[i].cos_lat, centers[cj].lat_r, centers[cj].lon_r, centers[cj].cos_lat);
-#endif
-            if (d<b) b=d;
-        }
-        for(int p=center_pos+1; p<k; ++p){                                 // Scan forward window
-            double dlat=fabs(cidx[p].lat - plat);
-            if (dlat > sil_lat_pad) break;
-            int cj=cidx[p].idx; if (cj==c) continue;
-            double lon_pad = SEARCH_SPATIAL_KM / (111.32 * fmax(1e-6, cos(deg_to_rad(plat))));
-            double clon = stats[cj].centroid_lon;
-            if (fabs(req[i].longitude - clon) > lon_pad*2) continue;
-#if SIL_USE_HAVERSINE
-            double d = dist_km_haversine(req[i].lat_rad, req[i].lon_rad, centers[cj].lat_r, centers[cj].lon_r);
-#else
-            double d = dist_km_equirect(req[i].lat_rad, req[i].lon_rad, req[i].cos_lat, centers[cj].lat_r, centers[cj].lon_r, centers[cj].cos_lat);
-#endif
-            if (d<b) b=d;
-        }
-
-        if (b > 1e11 && k>1){                                             // Fallback: full scan
-            for(int cj=0;cj<k;cj++){ if(cj==c) continue;
+            for(int p=center_pos; p>=0; --p){                                 // Scan backward window
+                int cj=cidx[p].idx; double dlat=fabs(cidx[p].lat - plat);
+                if (dlat > sil_lat_pad) break;
+                if (cj==c) continue;
+                double lon_pad = SEARCH_SPATIAL_KM / (111.32 * fmax(1e-6, cos(deg_to_rad(plat))));
+                double clon = stats[cj].centroid_lon;
+                if (fabs(req[i].longitude - clon) > lon_pad*2) continue;
 #if SIL_USE_HAVERSINE
                 double d = dist_km_haversine(req[i].lat_rad, req[i].lon_rad, centers[cj].lat_r, centers[cj].lon_r);
 #else
@@ -460,17 +481,62 @@ static void compute_compactness_and_silhouette(ServiceRequest* req, int n, Clust
 #endif
                 if (d<b) b=d;
             }
+            for(int p=center_pos+1; p<k; ++p){                                 // Scan forward window
+                double dlat=fabs(cidx[p].lat - plat);
+                if (dlat > sil_lat_pad) break;
+                int cj=cidx[p].idx; if (cj==c) continue;
+                double lon_pad = SEARCH_SPATIAL_KM / (111.32 * fmax(1e-6, cos(deg_to_rad(plat))));
+                double clon = stats[cj].centroid_lon;
+                if (fabs(req[i].longitude - clon) > lon_pad*2) continue;
+#if SIL_USE_HAVERSINE
+                double d = dist_km_haversine(req[i].lat_rad, req[i].lon_rad, centers[cj].lat_r, centers[cj].lon_r);
+#else
+                double d = dist_km_equirect(req[i].lat_rad, req[i].lon_rad, req[i].cos_lat, centers[cj].lat_r, centers[cj].lon_r, centers[cj].cos_lat);
+#endif
+                if (d<b) b=d;
+            }
+
+            if (b > 1e11 && k>1){                                             // Fallback: full scan
+                for(int cj=0;cj<k;cj++){ if(cj==c) continue;
+#if SIL_USE_HAVERSINE
+                    double d = dist_km_haversine(req[i].lat_rad, req[i].lon_rad, centers[cj].lat_r, centers[cj].lon_r);
+#else
+                    double d = dist_km_equirect(req[i].lat_rad, req[i].lon_rad, req[i].cos_lat, centers[cj].lat_r, centers[cj].lon_r, centers[cj].cos_lat);
+#endif
+                    if (d<b) b=d;
+                }
+            }
+
+            double denom = (a>b? a : b);                                      // Silhouette denominator
+            double s = (denom > 1e-12) ? (b - a) / denom : 0.0;               // Silhouette value
+
+            local_dist[c] += a;
+            local_silh[c] += s;
+            local_cnt[c]  += 1;
         }
 
-        double denom = (a>b? a : b);                                      // Silhouette denominator
-        double s = (denom > 1e-12) ? (b - a) / denom : 0.0;               // Silhouette value
+        #pragma omp critical
+        {
+            for (int c=0;c<k;c++){
+                sum_dist[c] += local_dist[c];
+                sum_silh[c] += local_silh[c];
+                cnt[c]      += local_cnt[c];
+            }
+        }
 
-        sum_dist[c] += a; sum_silh[c] += s; cnt[c] += 1;
+        free(local_dist);
+        free(local_silh);
+        free(local_cnt);
     }
 
     for(int c=0;c<k;c++){
-        if (cnt[c]>0){ stats[c].avg_dist_km = sum_dist[c]/cnt[c]; stats[c].silhouette = sum_silh[c]/cnt[c]; }
-        else { stats[c].avg_dist_km=0.0; stats[c].silhouette=0.0; }
+        if (cnt[c]>0){
+            stats[c].avg_dist_km = sum_dist[c]/cnt[c];
+            stats[c].silhouette  = sum_silh[c]/cnt[c];
+        } else {
+            stats[c].avg_dist_km=0.0;
+            stats[c].silhouette=0.0;
+        }
     }
 
     free(centers); free(cidx); free(sum_dist); free(sum_silh); free(cnt);
@@ -486,16 +552,20 @@ static void compute_pairwise_median_for_top_clusters(ServiceRequest* req, Cluste
     qsort(v,k,sizeof(View),cmpv);
 
     const int NBINS = (int)(HIST_MAX_DIST_KM / HIST_BIN_KM) + 1;   // Number of histogram bins
-    unsigned long long* hist=(unsigned long long*)malloc(sizeof(unsigned long long)*NBINS); // Histogram buffer
 
     int top = (HIST_TOPK<k)?HIST_TOPK:k;                           // Number of clusters to process
+
+    // Parallelize over top clusters — each thread gets its own local histogram
+    #pragma omp parallel for
     for(int t=0;t<top;t++){
         int cid=v[t].idx;                                          // Current cluster id
         int off=mi->offsets[cid], len=mi->offsets[cid+1]-off;      // Member range
         if (len<2){ stats[cid].med_pair_km=0.0; continue; }
         int m=len; if(m>HIST_MAX_MEMBERS) m=HIST_MAX_MEMBERS;      // Truncated member count
 
-        memset(hist,0,sizeof(unsigned long long)*NBINS);
+        unsigned long long hist[NBINS];
+        memset(hist,0,sizeof(hist));
+
         for(int i=0;i<m;i++){
             int ii=mi->members[off+i];
             for(int j=i+1;j<m;j++){
@@ -511,7 +581,7 @@ static void compute_pairwise_median_for_top_clusters(ServiceRequest* req, Cluste
         for(int b=0;b<NBINS;b++){ cum+=hist[b]; if(cum>=half){ med=(b+0.5)*HIST_BIN_KM; break; } }
         stats[cid].med_pair_km=med;
     }
-    free(hist); free(v);
+    free(v);
 #else
     (void)req; (void)stats; (void)k; (void)mi;
 #endif
@@ -525,7 +595,7 @@ static int cmp_clusterview_desc(const void* a,const void* b){
 }
 
 int main(int argc, char** argv) { // Run full pipeline and print summary report
-    printf("=== NYC311 Spatiotemporal Clustering (header-driven, blocked + heavy analytics) ===\n");
+    printf("=== NYC311 Spatiotemporal Clustering (OpenMP analytics, header-driven, blocked + heavy analytics) ===\n");
 
     ServiceRequest* requests=(ServiceRequest*)malloc(MAX_RECORDS*sizeof(ServiceRequest)); // Main record buffer
     if(!requests){ printf("Memory allocation failed\n"); return 1; }
@@ -546,7 +616,8 @@ int main(int argc, char** argv) { // Run full pipeline and print summary report
     }
 
     clock_gettime(CLOCK_MONOTONIC,&t1p);
-    double parse_time=(t1p.tv_sec-t0p.tv_sec)+(t1p.tv_nsec-t0p.tv_nsec)/1e9; // Parse phase duration (not printed by request)
+    double parse_time=(t1p.tv_sec-t0p.tv_sec)+(t1p.tv_nsec-t0p.tv_nsec)/1e9; // Parse phase duration
+    (void)parse_time; // Not printed, silence warning
 
     if(total_records<=0){ printf("No records loaded. Exiting.\n"); free(requests); return 1; }
 
@@ -580,12 +651,12 @@ int main(int argc, char** argv) { // Run full pipeline and print summary report
         qsort(view,vcount,sizeof(ClusterView),cmp_clusterview_desc);
     }
 
-    // Report: print run stats (without parse-time line per request) and top clusters
+    // Report: print run stats and top clusters
     printf("\n=== RESULTS ===\n");
     printf("Records processed: %d\n", total_records);
     printf("Clusters found (size >= %d): %d\n", MIN_CLUSTER_SIZE, num_clusters);
     printf("Clustering + basic stats: %.2f s\n", cluster_time);
-    printf("Heavy analytics time: %.2f s\n", quality_time);
+    printf("Heavy analytics time (OpenMP): %.2f s\n", quality_time);
     printf("Total wall time: %.2f s (%.2f min)\n", total_wall, total_wall/60.0);
 
     printf("\nTop 10 Largest Clusters:\n");
@@ -593,8 +664,8 @@ int main(int argc, char** argv) { // Run full pipeline and print summary report
            "Cluster","Members","Latitude","Longitude","AvgHours","PeakHr","AvgDistKm","Silhouette","MedPairKm","AxisRatio","Complaint Type");
     printf("-------------------------------------------------------------------------------------------------------------------------------------\n");
     int printed=0; // Number printed so far
-    for(int k=0; k<vcount && printed<10; k++){
-        int i=view[k].idx; if(stats[i].member_count<=0) continue;
+    for(int k2=0; k2<vcount && printed<10; k2++){
+        int i=view[k2].idx; if(stats[i].member_count<=0) continue;
         printf("%-8d %-8d %-10.6f %-10.6f %-9.2f %-7d %-10.3f %-11.3f %-10.3f %-10.3f %-30s\n",
                stats[i].cluster_id, stats[i].member_count,
                stats[i].centroid_lat, stats[i].centroid_lon,
